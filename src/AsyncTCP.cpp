@@ -103,48 +103,63 @@ static inline bool _init_async_event_queue(){
     return true;
 }
 
-static inline bool _send_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueSend(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _send_async_event(lwip_event_packet_t ** e_buf){
+    return _async_queue && xQueueSend(_async_queue, e_buf, portMAX_DELAY) == pdPASS;
 }
 
-static inline bool _prepend_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueSendToFront(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _prepend_async_event(lwip_event_packet_t ** e_buf){
+    return _async_queue && xQueueSendToFront(_async_queue, e_buf, portMAX_DELAY) == pdPASS;
 }
 
-static inline bool _get_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueReceive(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _get_async_event(lwip_event_packet_t ** e_buf){
+    return _async_queue && xQueueReceive(_async_queue, e_buf, portMAX_DELAY) == pdPASS;
 }
 
-static bool _remove_events_with_arg(void * arg){
+// Removes (from the _async_queue) and also frees the associated memory of
+// any event packages where the void *arg struct member is identical
+// to the one of the input event packet by pointer stored in e_buf.
+//
+// This always iterates over the whole queue and adds everything back
+// in the same order except for the removed elements
+//
+// The event package pointer in the input e_buf is NULLed and can/must be freed later
+static bool _remove_events_with_arg(lwip_event_packet_t ** e_buf){
+    lwip_event_packet_t * packet_in = *e_buf;
     lwip_event_packet_t * first_packet = NULL;
     lwip_event_packet_t * packet = NULL;
 
-    if(!_async_queue){
+    if(!_async_queue || !packet_in){
         return false;
+    } else {
+        // Nullifying the event packet pointer so that it is safe to call
+        // free() later even if there are duplicate events in the queue
+        *e_buf = NULL;
     }
-    //figure out which is the first packet so we can keep the order
+    int arg_in = reinterpret_cast<int>(packet_in->arg);
+    // Figure out which is the first packet so we can keep the order
     while(!first_packet){
         if(xQueueReceive(_async_queue, &first_packet, 0) != pdPASS){
             return false;
         }
-        //discard packet if matching
-        if((int)first_packet->arg == (int)arg){
+        // Packet was already removed from the queue, so if matching, it is
+        // not added back but discarded, and also its memory is freed.
+        if(reinterpret_cast<int>(first_packet->arg) == arg_in){
             free(first_packet);
             first_packet = NULL;
-        //return first packet to the back of the queue
-        } else if(xQueueSend(_async_queue, &first_packet, portMAX_DELAY) != pdPASS){
+        // If not matching, return packet back to the end of the queue and continue
+        } else if(xQueueSendToBack(_async_queue, &first_packet, portMAX_DELAY) != pdPASS){
             return false;
         }
     }
-
+    // Same for all othes until arriving back again at the front (first_packet)
     while(xQueuePeek(_async_queue, &packet, 0) == pdPASS && packet != first_packet){
         if(xQueueReceive(_async_queue, &packet, 0) != pdPASS){
             return false;
         }
-        if((int)packet->arg == (int)arg){
+        if(reinterpret_cast<int>(packet->arg) == arg_in){
             free(packet);
             packet = NULL;
-        } else if(xQueueSend(_async_queue, &packet, portMAX_DELAY) != pdPASS){
+        } else if(xQueueSendToBack(_async_queue, &packet, portMAX_DELAY) != pdPASS){
             return false;
         }
     }
@@ -156,7 +171,7 @@ static void _handle_async_event(lwip_event_packet_t * e){
         // do nothing when arg is NULL
         //ets_printf("event arg == NULL: 0x%08x\n", e->recv.pcb);
     } else if(e->event == LWIP_TCP_CLEAR){
-        _remove_events_with_arg(e->arg);
+        _remove_events_with_arg(&e);
     } else if(e->event == LWIP_TCP_RECV){
         //ets_printf("-R: 0x%08x\n", e->recv.pcb);
         AsyncClient::_s_recv(e->arg, e->recv.pcb, e->recv.pb, e->recv.err);
@@ -182,7 +197,7 @@ static void _handle_async_event(lwip_event_packet_t * e){
         //ets_printf("D: 0x%08x %s = %s\n", e->arg, e->dns.name, ipaddr_ntoa(&e->dns.addr));
         AsyncClient::_s_dns_found(e->dns.name, &e->dns.addr, e->arg);
     }
-    free((void*)(e));
+    free(e);
 }
 
 static void _async_service_task(void *pvParameters){
